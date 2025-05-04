@@ -1,0 +1,117 @@
+pipeline {
+  agent {
+    docker {
+      image 'sohelk/maven-sohel-docker-agent:v1'
+      args '--user root -v /var/run/docker.sock:/var/run/docker.sock'
+    }
+  }
+
+  // === Define user-configurable parameters ===
+  parameters {
+    string(name: 'REPO_URL', defaultValue: 'https://github.com/Sohail130/Jenkins-Zero-To-Hero.git', description: 'Git repository URL')
+    string(name: 'BRANCH', defaultValue: 'main', description: 'Branch to build')
+    string(name: 'SONAR_URL', defaultValue: 'http://43.204.237.74:9000/', description: 'SonarQube Server URL')
+    string(name: 'DEPLOYMENT_YAML', defaultValue: 'java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml', description: 'Path to deployment YAML file')
+    string(name: 'GIT_USER_NAME', defaultValue: 'Sohail130', description: 'GitHub username for commit')
+    string(name: 'GIT_USER_EMAIL', defaultValue: 'khansh1515@gmail.com', description: 'GitHub email for commit')
+  }
+
+  environment {
+    GIT_REPO_NAME = "${params.REPO_URL.tokenize('/').last().replace('.git', '')}"
+    DOCKER_IMAGE_TAG = ''
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: "${params.BRANCH}", url: "${params.REPO_URL}"
+        script {
+          env.GIT_COMMIT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+          env.DOCKER_IMAGE_TAG = "${env.GIT_COMMIT}-${env.BUILD_NUMBER}"
+          env.DOCKER_IMAGE = "sohelk/ultimate-cicd:${env.DOCKER_IMAGE_TAG}"
+        }
+      }
+    }
+
+    stage('Parallel Build & Static Analysis') {
+      parallel {
+        stage('Build and Test') {
+          steps {
+            sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn clean package'
+          }
+          post {
+            always {
+              junit 'java-maven-sonar-argocd-helm-k8s/spring-boot-app/target/surefire-reports/*.xml'
+            }
+          }
+        }
+
+        stage('Static Code Analysis') {
+          steps {
+            withCredentials([string(credentialsId: 'sonar', variable: 'SONAR_AUTH_TOKEN')]) {
+              sh '''
+                cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
+                mvn sonar:sonar -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.host.url=${params.SONAR_URL}
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('Build and Push Docker Image') {
+      environment {
+        REGISTRY_CREDENTIALS = credentials('docker-cred')
+      }
+      steps {
+        script {
+          sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && docker build -t ${DOCKER_IMAGE} .'
+          def dockerImage = docker.image("${DOCKER_IMAGE}")
+          docker.withRegistry('https://index.docker.io/v1/', "docker-cred") {
+            dockerImage.push()
+          }
+        }
+      }
+    }
+
+    stage('Update Deployment File') {
+      steps {
+        withCredentials([string(credentialsId: 'argo-cd-k8-demo', variable: 'GITHUB_TOKEN')]) {
+          sh """
+            git config user.email "${params.GIT_USER_EMAIL}"
+            git config user.name "${params.GIT_USER_NAME}"
+            sed -i "s/sohelk\\/ultimate-cicd:[0-9]\\+/sohelk\\/ultimate-cicd:replaceImageTag/g" java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
+            sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
+            #yq e '.spec.template.spec.containers[0].image = "${DOCKER_IMAGE}"' -i ${params.DEPLOYMENT_YAML}
+            git add ${params.DEPLOYMENT_YAML}
+            git commit -m "Update deployment image to ${DOCKER_IMAGE_TAG}"
+            git push https://${GITHUB_TOKEN}@github.com/${params.GIT_USER_NAME}/${env.GIT_REPO_NAME} HEAD:${params.BRANCH}
+          """
+        }
+      }
+    }
+
+    // Optional: Trigger ArgoCD Sync
+    // stage('Trigger ArgoCD Sync') {
+    //   steps {
+    //     withCredentials([string(credentialsId: 'argocd-token', variable: 'ARGOCD_TOKEN')]) {
+    //       sh 'argocd app sync spring-boot-app --auth-token $ARGOCD_TOKEN --server $ARGOCD_SERVER'
+    //     }
+    //   }
+    // }
+
+    stage('Cleanup') {
+      steps {
+        sh 'docker image prune -f'
+      }
+    }
+  }
+
+  post {
+    failure {
+      mail to: 'khansh1515@gmail.com',
+           subject: "❌ Build Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+           body: "Build failed. See details at: ${env.BUILD_URL}"
+    }
+  }
+}
