@@ -106,7 +106,7 @@ pipeline {
       }
     }
   }
-
+###Send me a mail###
   post {
     failure {
       mail to: 'khansh1515@gmail.com',
